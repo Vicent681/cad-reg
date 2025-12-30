@@ -3,3 +3,4 @@ openai>=1.51.0
 gradio==3.50.2
 huggingface_hub<0.25
 Pillow>=10.0.0
+pdf2image>=1.17.0

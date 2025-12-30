@@ -4,12 +4,18 @@
 from __future__ import annotations
 
 import os
+import shutil
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import List, Sequence
 
 import gradio as gr
+from PIL import Image
 
 from multimodal_prompt import stream_modelscope_endpoint
+from pdf2png import convert_pdf_to_pngs
+from split_img import TileInfo, split_image_into_tiles
 
 
 DEFAULT_MODEL = "Qwen/Qwen3-VL-235B-A22B-Instruct"
@@ -23,6 +29,36 @@ SCROLL_CSS = """
     white-space: pre-wrap !important;
 }
 """
+
+PDF_DPI = int(os.getenv("CAD_REG_PDF_DPI", "350"))
+TILING_ROWS = int(os.getenv("CAD_REG_TILE_ROWS", "3"))
+TILING_COLS = int(os.getenv("CAD_REG_TILE_COLS", "4"))
+TILING_OVERLAP = int(os.getenv("CAD_REG_TILE_OVERLAP", "200"))
+SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+PAGE_OUTPUT_DIR = Path(os.getenv("CAD_REG_PAGE_DIR", "out_png"))
+TILE_OUTPUT_DIR = Path(os.getenv("CAD_REG_TILE_DIR", "tiles_out"))
+
+
+@dataclass
+class TileContext:
+    order: int
+    source_file: str
+    page_number: int
+    row: int
+    col: int
+    bbox: tuple[int, int, int, int]
+    path: Path
+    is_full_image: bool
+
+
+@dataclass
+class PageImage:
+    source_file: str
+    page_number: int
+    path: Path
+    doc_slug: str
+    width: int
+    height: int
 
 
 def _resolve_file_paths(files: Sequence[object]) -> List[Path]:
@@ -47,6 +83,128 @@ def _default_api_key() -> str | None:
     )
 
 
+def _is_pdf(path: Path) -> bool:
+    return path.suffix.lower() == ".pdf"
+
+
+def _is_supported_image(path: Path) -> bool:
+    return path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
+
+
+def _prepare_run_directories(run_id: str) -> tuple[Path, Path]:
+    pages_root = PAGE_OUTPUT_DIR / run_id
+    tiles_root = TILE_OUTPUT_DIR / run_id
+    pages_root.mkdir(parents=True, exist_ok=True)
+    tiles_root.mkdir(parents=True, exist_ok=True)
+    return pages_root, tiles_root
+
+
+def _prepare_page_images(paths: Sequence[Path], pages_root: Path) -> List[PageImage]:
+    page_images: List[PageImage] = []
+    for idx, src_path in enumerate(paths):
+        doc_slug = f"doc_{idx:03d}_{src_path.stem}"
+        source_name = src_path.name
+        if _is_pdf(src_path):
+            pdf_dir = pages_root / doc_slug
+            page_paths = convert_pdf_to_pngs(
+                src_path,
+                pdf_dir,
+                dpi=PDF_DPI,
+                trim=False,
+                trim_tol=245,
+                prefix=doc_slug,
+            )
+        elif _is_supported_image(src_path):
+            doc_dir = pages_root / doc_slug
+            doc_dir.mkdir(parents=True, exist_ok=True)
+            dest_image = doc_dir / source_name
+            shutil.copy2(src_path, dest_image)
+            page_paths = [dest_image]
+        else:
+            raise ValueError(f"暂不支持的文件类型: {src_path.name}")
+
+        if not page_paths:
+            raise ValueError(f"{src_path.name} 未能生成有效的页面图像。")
+
+        for page_idx, page_path in enumerate(page_paths, start=1):
+            with Image.open(page_path) as img:
+                width, height = img.size
+            page_images.append(
+                PageImage(
+                    source_file=source_name,
+                    page_number=page_idx,
+                    path=page_path,
+                    doc_slug=doc_slug,
+                    width=width,
+                    height=height,
+                )
+            )
+    return page_images
+
+
+def _prepare_tiles(page_images: Sequence[PageImage], tiles_root: Path) -> List[TileContext]:
+    contexts: List[TileContext] = []
+    tile_counter = 0
+    for page in page_images:
+        tile_dir = tiles_root / f"{page.doc_slug}_page_{page.page_number:03d}"
+        tiles: List[TileInfo] = split_image_into_tiles(
+            page.path,
+            tile_dir,
+            rows=TILING_ROWS,
+            cols=TILING_COLS,
+            overlap=TILING_OVERLAP,
+            trim=False,
+            trim_tol=245,
+            enhance=False,
+            include_full_image=True,
+        )
+        if not tiles:
+            raise ValueError(f"{page.source_file} 第 {page.page_number} 页未生成任何图块。")
+        for tile in tiles:
+            contexts.append(
+                TileContext(
+                    order=tile_counter,
+                    source_file=page.source_file,
+                    page_number=page.page_number,
+                    row=tile.row,
+                    col=tile.col,
+                    bbox=tile.bbox,
+                    path=tile.path,
+                    is_full_image=tile.is_full_image,
+                )
+            )
+            tile_counter += 1
+    return contexts
+
+
+def _parse_split_choice(choice: str | None) -> bool:
+    if choice is None:
+        return True
+    normalized = choice.strip().lower()
+    if normalized in {"切块识别", "切块", "split"}:
+        return True
+    if normalized in {"原图识别", "原图", "nosplit"}:
+        return False
+    return True
+
+
+def _format_tile_context(tile_contexts: Sequence[TileContext]) -> str:
+    lines = []
+    for tile in tile_contexts:
+        position_desc = (
+            "全图"
+            if tile.is_full_image
+            else f"行: {tile.row + 1} | 列: {tile.col + 1}"
+        )
+        lines.append(
+            (
+                f"[块{tile.order + 1:02d}] 文件: {tile.source_file} | 页: {tile.page_number} | "
+                f"{position_desc} | 区域: {tile.bbox}"
+            )
+        )
+    return "图块上下文（按顺序送入模型）：\n" + "\n".join(lines)
+
+
 def analyze_cad_images(
     files: Sequence[object],
     prompt: str,
@@ -57,6 +215,7 @@ def analyze_cad_images(
     api_key: str,
     temperature: float,
     max_tokens: int,
+    split_choice: str,
 ):
     if not files:
         yield "请至少上传一张图纸。"
@@ -83,7 +242,63 @@ def analyze_cad_images(
         yield "请提供有效的 ModelScope API Key。"
         return
 
-    aggregated = ""
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        pages_root, tiles_root = _prepare_run_directories(run_id)
+    except Exception as exc:
+        yield f"无法准备输出目录: {exc}"
+        return
+
+    should_split = _parse_split_choice(split_choice)
+
+    try:
+        page_images = _prepare_page_images(paths, pages_root)
+    except Exception as exc:
+        yield f"预处理失败: {exc}"
+        return
+
+    if should_split:
+        try:
+            tile_contexts = _prepare_tiles(page_images, tiles_root)
+        except Exception as exc:
+            yield f"分块失败: {exc}"
+            return
+        if not tile_contexts:
+            yield "预处理失败：未生成任何图块。"
+            return
+        artifact_desc = f"图块已保存至 {tiles_root.resolve()}。"
+    else:
+        tile_contexts = []
+        for order, page in enumerate(page_images):
+            tile_contexts.append(
+                TileContext(
+                    order=order,
+                    source_file=page.source_file,
+                    page_number=page.page_number,
+                    row=-1,
+                    col=-1,
+                    bbox=(0, 0, page.width, page.height),
+                    path=page.path,
+                    is_full_image=True,
+                )
+            )
+        if not tile_contexts:
+            yield "预处理失败：未生成任何原图供识别。"
+            return
+        artifact_desc = f"原图已保存至 {pages_root.resolve()}。"
+
+    tile_paths = [ctx.path for ctx in tile_contexts]
+    tile_context_text = _format_tile_context(tile_contexts)
+    final_prompt = f"{final_prompt}\n\n{tile_context_text}"
+
+    mode_desc = "切块识别" if should_split else "原图识别"
+    aggregated = (
+        f"{mode_desc}预处理完成：共准备 {len(tile_paths)} 个输入图像，保持顺序用于上下文。"
+        f"{artifact_desc}（批次: {run_id}）\n\n"
+    )
+    yield aggregated
+
+    received_tokens = False
     try:
         for delta in stream_modelscope_endpoint(
             base_url=base_url.strip() or DEFAULT_BASE_URL,
@@ -91,21 +306,21 @@ def analyze_cad_images(
             model=model.strip() or DEFAULT_MODEL,
             system_prompt=system_prompt.strip() or DEFAULT_SYSTEM_PROMPT,
             prompt=final_prompt,
-            image_paths=paths,
+            image_paths=tile_paths,
             temperature=float(temperature),
             max_tokens=int(max_tokens),
         ):
+            received_tokens = True
             aggregated += delta
             yield aggregated
     except Exception as exc:  # pragma: no cover - surface runtime errors in UI
-        if aggregated:
-            yield aggregated + f"\n\n[错误] {exc}"
-        else:
-            yield f"推理失败: {exc}"
+        message = (aggregated + f"\n\n[错误] {exc}") if aggregated else f"推理失败: {exc}"
+        yield message
         return
 
-    if not aggregated:
-        yield "模型未返回有效文本，请重试。"
+    if not received_tokens:
+        aggregated = aggregated.rstrip() + "\n\n模型未返回有效文本，请重试。"
+        yield aggregated
 
 
 def build_interface() -> gr.Blocks:
@@ -115,9 +330,14 @@ def build_interface() -> gr.Blocks:
         with gr.Row():
             file_input = gr.File(
                 label="CAD 图纸 (可多张)",
-                file_types=["image"],
+                file_types=["image", "application/pdf"],
                 file_count="multiple",
                 type="file",
+            )
+            split_mode = gr.Radio(
+                label="处理方式",
+                choices=["切块识别", "原图识别"],
+                value="切块识别",
             )
             output_box = gr.Textbox(
                 label="分析结果",
@@ -180,6 +400,7 @@ def build_interface() -> gr.Blocks:
                 api_key_box,
                 temperature_slider,
                 max_tokens_slider,
+                split_mode,
             ],
             outputs=output_box,
         )
