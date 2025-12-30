@@ -1,7 +1,9 @@
 import os
-import cv2
 from collections import defaultdict
+from pathlib import Path
+from typing import List, Tuple
 
+import cv2
 import numpy as np
 
 
@@ -47,7 +49,14 @@ def merge_rects_in_list(rect_list, threshold):
     return rect_list
 
 
-def graph_split(img_path, tmp_path, merge_threshold=11.5, grid_size=200, max_area_riot=0.25, min_area=150):
+def graph_split(
+    img_path,
+    tmp_path,
+    merge_threshold=11.5,
+    grid_size=200,
+    max_area_riot=0.25,
+    min_area=150,
+) -> List[Tuple[Path, Tuple[int, int, int, int]]]:
     """
     参数：
     merge_threshold：连通域合并阈值
@@ -135,7 +144,7 @@ def graph_split(img_path, tmp_path, merge_threshold=11.5, grid_size=200, max_are
     # cv2.imwrite('with_merged_boxes_optimized.png', output_img)
 
     # 遍历所有最终合并的矩形，裁剪并保存
-    result = []
+    result: List[Tuple[Path, Tuple[int, int, int, int]]] = []
     os.makedirs(tmp_path, exist_ok=True)
     for idx, (x, y, w, h) in enumerate(final_rects):
         # 边界安全检查（防止越界）
@@ -151,9 +160,9 @@ def graph_split(img_path, tmp_path, merge_threshold=11.5, grid_size=200, max_are
 
         # 保存为 crop_000.png, crop_001.png, ...
         filename = f"crop_{idx:03d}.png"
-        save_path = os.path.join(tmp_path, filename)
-        cv2.imwrite(save_path, cropped)
-        result.append(save_path)
+        save_path = Path(os.path.join(tmp_path, filename))
+        cv2.imwrite(str(save_path), cropped)
+        result.append((save_path, (x, y, x2, y2)))
 
     return result
 

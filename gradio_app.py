@@ -15,6 +15,7 @@ from PIL import Image
 
 from multimodal_prompt import stream_modelscope_endpoint
 from pdf2png import convert_pdf_to_pngs
+from split_connectivity import graph_split
 from split_img import TileInfo, split_image_into_tiles
 
 
@@ -37,6 +38,10 @@ TILING_OVERLAP = int(os.getenv("CAD_REG_TILE_OVERLAP", "200"))
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 PAGE_OUTPUT_DIR = Path(os.getenv("CAD_REG_PAGE_DIR", "out_png"))
 TILE_OUTPUT_DIR = Path(os.getenv("CAD_REG_TILE_DIR", "tiles_out"))
+CONNECTIVITY_MERGE_THRESHOLD = float(os.getenv("CAD_REG_CONN_MERGE_THRESHOLD", "11.5"))
+CONNECTIVITY_GRID_SIZE = int(os.getenv("CAD_REG_CONN_GRID_SIZE", "200"))
+CONNECTIVITY_MAX_AREA_RIOT = float(os.getenv("CAD_REG_CONN_MAX_AREA_RIOT", "0.25"))
+CONNECTIVITY_MIN_AREA = int(os.getenv("CAD_REG_CONN_MIN_AREA", "150"))
 
 
 @dataclass
@@ -142,7 +147,7 @@ def _prepare_page_images(paths: Sequence[Path], pages_root: Path) -> List[PageIm
     return page_images
 
 
-def _prepare_tiles(page_images: Sequence[PageImage], tiles_root: Path) -> List[TileContext]:
+def _prepare_grid_tiles(page_images: Sequence[PageImage], tiles_root: Path) -> List[TileContext]:
     contexts: List[TileContext] = []
     tile_counter = 0
     for page in page_images:
@@ -177,6 +182,40 @@ def _prepare_tiles(page_images: Sequence[PageImage], tiles_root: Path) -> List[T
     return contexts
 
 
+def _prepare_connectivity_tiles(page_images: Sequence[PageImage], tiles_root: Path) -> List[TileContext]:
+    contexts: List[TileContext] = []
+    tile_counter = 0
+    for page in page_images:
+        tile_dir = tiles_root / f"{page.doc_slug}_page_{page.page_number:03d}_conn"
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        segments = graph_split(
+            str(page.path),
+            tile_dir.as_posix(),
+            merge_threshold=CONNECTIVITY_MERGE_THRESHOLD,
+            grid_size=CONNECTIVITY_GRID_SIZE,
+            max_area_riot=CONNECTIVITY_MAX_AREA_RIOT,
+            min_area=CONNECTIVITY_MIN_AREA,
+        )
+        if not segments:
+            continue
+        for segment_path, bbox in segments:
+            x1, y1, x2, y2 = bbox
+            contexts.append(
+                TileContext(
+                    order=tile_counter,
+                    source_file=page.source_file,
+                    page_number=page.page_number,
+                    row=-1,
+                    col=-1,
+                    bbox=(x1, y1, x2, y2),
+                    path=Path(segment_path),
+                    is_full_image=False,
+                )
+            )
+            tile_counter += 1
+    return contexts
+
+
 def _parse_split_choice(choice: str | None) -> bool:
     if choice is None:
         return True
@@ -188,13 +227,26 @@ def _parse_split_choice(choice: str | None) -> bool:
     return True
 
 
+def _resolve_split_strategy(choice: str | None) -> str:
+    if not choice:
+        return "网格分块"
+    choice = choice.strip()
+    if choice in {"网格分块", "连通域分块"}:
+        return choice
+    return "网格分块"
+
+
 def _format_tile_context(tile_contexts: Sequence[TileContext]) -> str:
     lines = []
     for tile in tile_contexts:
         position_desc = (
             "全图"
             if tile.is_full_image
-            else f"行: {tile.row + 1} | 列: {tile.col + 1}"
+            else (
+                f"行: {tile.row + 1} | 列: {tile.col + 1}"
+                if tile.row >= 0 and tile.col >= 0
+                else "自适应块"
+            )
         )
         lines.append(
             (
@@ -216,6 +268,7 @@ def analyze_cad_images(
     temperature: float,
     max_tokens: int,
     split_choice: str,
+    split_strategy: str,
 ):
     if not files:
         yield "请至少上传一张图纸。"
@@ -250,6 +303,7 @@ def analyze_cad_images(
         return
 
     should_split = _parse_split_choice(split_choice)
+    strategy_choice = _resolve_split_strategy(split_strategy)
 
     try:
         page_images = _prepare_page_images(paths, pages_root)
@@ -259,7 +313,10 @@ def analyze_cad_images(
 
     if should_split:
         try:
-            tile_contexts = _prepare_tiles(page_images, tiles_root)
+            if strategy_choice == "连通域分块":
+                tile_contexts = _prepare_connectivity_tiles(page_images, tiles_root)
+            else:
+                tile_contexts = _prepare_grid_tiles(page_images, tiles_root)
         except Exception as exc:
             yield f"分块失败: {exc}"
             return
@@ -292,9 +349,10 @@ def analyze_cad_images(
     final_prompt = f"{final_prompt}\n\n{tile_context_text}"
 
     mode_desc = "切块识别" if should_split else "原图识别"
+    strategy_desc = f"切块方式: {strategy_choice}" if should_split else "使用原图"
     aggregated = (
         f"{mode_desc}预处理完成：共准备 {len(tile_paths)} 个输入图像，保持顺序用于上下文。"
-        f"{artifact_desc}（批次: {run_id}）\n\n"
+        f"{artifact_desc}（批次: {run_id}; {strategy_desc}）\n\n"
     )
     yield aggregated
 
@@ -339,12 +397,18 @@ def build_interface() -> gr.Blocks:
                 choices=["切块识别", "原图识别"],
                 value="切块识别",
             )
-            output_box = gr.Textbox(
-                label="分析结果",
-                lines=16,
-                interactive=False,
-                elem_classes=["scroll-output"],
+            split_strategy = gr.Radio(
+                label="切块方式（仅在切块识别时生效）",
+                choices=["网格分块", "连通域分块"],
+                value="网格分块",
             )
+
+        output_box = gr.Textbox(
+            label="分析结果",
+            lines=16,
+            interactive=False,
+            elem_classes=["scroll-output"],
+        )
 
         prompt_box = gr.Textbox(
             label="用户提示词",
@@ -401,6 +465,7 @@ def build_interface() -> gr.Blocks:
                 temperature_slider,
                 max_tokens_slider,
                 split_mode,
+                split_strategy,
             ],
             outputs=output_box,
         )

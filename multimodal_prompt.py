@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Send an image + dynamic prompt to a ModelScope endpoint via the OpenAI client."""
 
+# 该脚本负责把多张图像 + 动态提示词一并发送到 ModelScope 的 OpenAI 兼容接口。
+
 from __future__ import annotations
 
 import argparse
@@ -34,6 +36,7 @@ class Arguments:
 
 
 def parse_arguments() -> Arguments:
+    """解析命令行参数，获取模型配置、提示词和图像路径。"""
     parser = argparse.ArgumentParser(
         description=(
             "Format a dynamic prompt, attach an image, and call a ModelScope model "
@@ -112,16 +115,18 @@ def parse_arguments() -> Arguments:
     if args.prompt_file:
         prompt_text = args.prompt_file.read_text(encoding="utf-8")
 
-    resolved_api_key = (
-        args.api_key
-        or os.getenv("MODELSCOPE_API_KEY")
-        or os.getenv("MODELSCOPE_TOKEN")
-        or os.getenv("OPENAI_API_KEY")
-    )
-    if not resolved_api_key:
-        parser.error(
-            "API key missing: use --api-key or set MODELSCOPE_API_KEY / MODELSCOPE_TOKEN / OPENAI_API_KEY."
-        )
+    # resolved_api_key = (
+    #     args.api_key
+    #     or os.getenv("MODELSCOPE_API_KEY")
+    #     or os.getenv("MODELSCOPE_TOKEN")
+    #     or os.getenv("OPENAI_API_KEY")
+    # )
+    # if not resolved_api_key:
+    #     parser.error(
+    #         "API key missing: use --api-key or set MODELSCOPE_API_KEY / MODELSCOPE_TOKEN / OPENAI_API_KEY."
+    #     )
+
+    resolved_api_key="ms-eaffb395-fb4c-4a2f-8d83-1aee7b1d925b"
 
     return Arguments(
         images=args.images,
@@ -138,6 +143,7 @@ def parse_arguments() -> Arguments:
 
 
 def encode_image(image_path: Path) -> tuple[str, str]:
+    """读取图像并转成 data URL 所需的 base64 编码与 MIME 类型。"""
     image_bytes = image_path.read_bytes()
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     mime_type, _ = mimetypes.guess_type(image_path.as_posix())
@@ -145,6 +151,7 @@ def encode_image(image_path: Path) -> tuple[str, str]:
 
 
 def build_chat_messages(system_prompt: str, prompt: str, image_paths: List[Path]) -> List[dict]:
+    """构造符合 OpenAI Chat Completions 格式的消息体，包含文本与多张图像。"""
     contents = [{"type": "text", "text": prompt}]
     for image_path in image_paths:
         image_b64, mime_type = encode_image(image_path)
@@ -163,6 +170,7 @@ def build_chat_messages(system_prompt: str, prompt: str, image_paths: List[Path]
 
 
 def extract_text_chunks(content: Any) -> List[str]:
+    """从响应的 content 字段中提取纯文本片段。"""
     chunks: List[str] = []
     if isinstance(content, str):
         chunks.append(content)
@@ -182,6 +190,7 @@ def extract_text_chunks(content: Any) -> List[str]:
 
 
 def extract_text_output(response) -> str:
+    """整理非流式接口返回的全部文本结果。"""
     choices = getattr(response, "choices", None) or []
     if not choices:
         return ""
@@ -206,6 +215,7 @@ def call_modelscope_endpoint(
     temperature: float,
     max_tokens: int,
 ) -> str:
+    """调用一次性接口，返回完整文本。"""
     client = OpenAI(base_url=base_url, api_key=api_key)
     messages = build_chat_messages(system_prompt, prompt, image_paths)
     response = client.chat.completions.create(
@@ -227,6 +237,7 @@ def stream_modelscope_endpoint(
     temperature: float,
     max_tokens: int,
 ) -> Generator[str, None, None]:
+    """以流式方式持续返回模型增量输出。"""
     client = OpenAI(base_url=base_url, api_key=api_key)
     messages = build_chat_messages(system_prompt, prompt, image_paths)
     stream = client.chat.completions.create(
@@ -254,6 +265,7 @@ def stream_modelscope_endpoint(
 
 
 def main() -> None:
+    """脚本入口：读取参数、校验文件并根据是否流式执行推理。"""
     args = parse_arguments()
 
     missing = [path for path in args.images if not path.exists()]
