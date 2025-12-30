@@ -14,6 +14,11 @@ from typing import Any, Generator, List
 from openai import OpenAI
 
 
+DEFAULT_MODEL = os.getenv("MODELSCOPE_MODEL") or "Qwen/Qwen3-VL-235B-A22B-Instruct"
+DEFAULT_BASE_URL = os.getenv("MODELSCOPE_BASE_URL") or "https://api-inference.modelscope.cn/v1"
+DEFAULT_SYSTEM_PROMPT = "你是一个CAD工程图纸识别的助手，你的任务是分析给定的图纸，给出专业的数值。"
+
+
 @dataclass
 class Arguments:
     images: List[Path]
@@ -55,7 +60,7 @@ def parse_arguments() -> Arguments:
 
     parser.add_argument(
         "--model",
-        default="Qwen/Qwen3-VL-235B-A22B-Instruct",
+        default=DEFAULT_MODEL,
         help=(
             "ModelScope model id (e.g., Qwen/Qwen3-VL-235B-A22B-Instruct). "
             "Defaults to the official Qwen3 VL reference model."
@@ -63,7 +68,7 @@ def parse_arguments() -> Arguments:
     )
     parser.add_argument(
         "--base-url",
-        default=os.getenv("MODELSCOPE_BASE_URL") or "https://api-inference.modelscope.cn/v1",
+        default=DEFAULT_BASE_URL,
         help="Base URL for the ModelScope OpenAI-compatible endpoint.",
     )
     parser.add_argument(
@@ -87,7 +92,7 @@ def parse_arguments() -> Arguments:
     )
     parser.add_argument(
         "--system-prompt",
-        default="你是一个CAD工程图纸识别的助手，你的任务是分析给定的图纸，给出专业的数值。",
+        default=DEFAULT_SYSTEM_PROMPT,
         help="System prompt injected ahead of each request. Defaults to a CAD-analysis instruction.",
     )
     parser.add_argument(

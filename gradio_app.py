@@ -50,6 +50,7 @@ def _default_api_key() -> str | None:
 def analyze_cad_images(
     files: Sequence[object],
     prompt: str,
+    extra_prompt: str,
     system_prompt: str,
     model: str,
     base_url: str,
@@ -71,6 +72,8 @@ def analyze_cad_images(
         return
 
     final_prompt = (prompt or "").strip()
+    if extra_prompt and extra_prompt.strip():
+        final_prompt = f"{final_prompt}\n\n补充说明：{extra_prompt.strip()}"
     if not final_prompt:
         yield "请输入提示词。"
         return
@@ -129,6 +132,12 @@ def build_interface() -> gr.Blocks:
             lines=3,
         )
 
+        extra_prompt_box = gr.Textbox(
+            label="补充提示词（可选）",
+            placeholder="例如：请重点关注结构标高和楼层关系。",
+            lines=2,
+        )
+
         system_box = gr.Textbox(
             label="系统提示词",
             value=DEFAULT_SYSTEM_PROMPT,
@@ -164,6 +173,7 @@ def build_interface() -> gr.Blocks:
             inputs=[
                 file_input,
                 prompt_box,
+                extra_prompt_box,
                 system_box,
                 model_box,
                 base_url_box,
