@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -40,6 +41,41 @@ def enhance_for_legibility(im: Image.Image, contrast: float = 1.15, sharpness: f
     return enhanced
 
 
+def _determine_grid_layout(
+    width: int,
+    height: int,
+    *,
+    max_tile_dim: int = 1200,
+    max_tiles: int = 4,
+    requested_rows: int = 3,
+    requested_cols: int = 4,
+) -> tuple[int, int]:
+    if width <= max_tile_dim and height <= max_tile_dim:
+        return 1, 1
+
+    min_rows_needed = max(1, math.ceil(height / max_tile_dim))
+    min_cols_needed = max(1, math.ceil(width / max_tile_dim))
+
+    max_row = min(max_tiles, max(requested_rows, min_rows_needed))
+    max_col = min(max_tiles, max(requested_cols, min_cols_needed))
+
+    candidates: List[tuple[int, int, int]] = []
+    for rows in range(1, max_row + 1):
+        for cols in range(1, max_col + 1):
+            if rows * cols > max_tiles:
+                continue
+            if height / rows <= max_tile_dim and width / cols <= max_tile_dim:
+                candidates.append((rows * cols, rows, cols))
+
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        _, rows, cols = candidates[0]
+        return rows, cols
+
+    # 如果无法在 max_tiles 内满足 1200 限制，退回到最小需要切分数
+    return min_rows_needed, min_cols_needed
+
+
 def split_image_into_tiles(
     image_path: Path,
     output_dir: Path,
@@ -52,7 +88,7 @@ def split_image_into_tiles(
     enhance: bool = False,
     contrast: float = 1.15,
     sharpness: float = 1.2,
-    include_full_image: bool = True,
+    include_full_image: bool = False,
 ) -> List[TileInfo]:
     """Split a large CAD image into overlapping tiles."""
     image_path = image_path.resolve()
@@ -67,8 +103,16 @@ def split_image_into_tiles(
         image = enhance_for_legibility(image, contrast=contrast, sharpness=sharpness)
 
     width, height = image.size
-    tile_width = width // cols
-    tile_height = height // rows
+    effective_rows, effective_cols = _determine_grid_layout(
+        width,
+        height,
+        max_tile_dim=1200,
+        max_tiles=4,
+        requested_rows=rows,
+        requested_cols=cols,
+    )
+    tile_width = width // effective_cols
+    tile_height = height // effective_rows
     tiles: List[TileInfo] = []
 
     if include_full_image:
@@ -86,8 +130,8 @@ def split_image_into_tiles(
             )
         )
 
-    for r in range(rows):
-        for c in range(cols):
+    for r in range(effective_rows):
+        for c in range(effective_cols):
             left = max(0, c * tile_width - overlap)
             upper = max(0, r * tile_height - overlap)
             right = min(width, (c + 1) * tile_width + overlap)

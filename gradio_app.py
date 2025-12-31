@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,14 +14,21 @@ from typing import List, Sequence
 import gradio as gr
 from PIL import Image
 
-from multimodal_prompt import stream_modelscope_endpoint
+from embedding_utils import embed_texts
+from milvus_store import insert_blocks, search_blocks
+from multimodal_prompt import (
+    call_modelscope_endpoint,
+    stream_modelscope_endpoint,
+)
 from pdf2png import convert_pdf_to_pngs
 from split_connectivity import graph_split
 from split_img import TileInfo, split_image_into_tiles
 
 
-DEFAULT_MODEL = "Qwen/Qwen3-VL-235B-A22B-Instruct"
-DEFAULT_BASE_URL = os.getenv("MODELSCOPE_BASE_URL") or "https://api-inference.modelscope.cn/v1"
+DEFAULT_MODEL = "qwen3-vl-plus"
+DEFAULT_BASE_URL = os.getenv("MODELSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_EMBED_MODEL = os.getenv("CAD_RAG_EMBED_MODEL", "text-embedding-v4")
+DEFAULT_EMBED_BASE_URL = os.getenv("CAD_RAG_EMBED_BASE_URL") or DEFAULT_BASE_URL
 DEFAULT_SYSTEM_PROMPT = "你是一个CAD工程图纸识别的助手，你的任务是分析给定的图纸，给出专业的数值。"
 SCROLL_CSS = """
 .scroll-output textarea {
@@ -38,10 +46,17 @@ TILING_OVERLAP = int(os.getenv("CAD_REG_TILE_OVERLAP", "200"))
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 PAGE_OUTPUT_DIR = Path(os.getenv("CAD_REG_PAGE_DIR", "out_png"))
 TILE_OUTPUT_DIR = Path(os.getenv("CAD_REG_TILE_DIR", "tiles_out"))
+CONNECTIVITY_OUTPUT_DIR = Path(os.getenv("CAD_REG_CONN_DIR", "conn_blocks"))
 CONNECTIVITY_MERGE_THRESHOLD = float(os.getenv("CAD_REG_CONN_MERGE_THRESHOLD", "11.5"))
 CONNECTIVITY_GRID_SIZE = int(os.getenv("CAD_REG_CONN_GRID_SIZE", "200"))
 CONNECTIVITY_MAX_AREA_RIOT = float(os.getenv("CAD_REG_CONN_MAX_AREA_RIOT", "0.25"))
 CONNECTIVITY_MIN_AREA = int(os.getenv("CAD_REG_CONN_MIN_AREA", "150"))
+GRID_MAX_TILE_DIM = int(os.getenv("CAD_REG_GRID_MAX_TILE_DIM", "1000"))
+DEFAULT_BLOCK_SUMMARY_PROMPT = os.getenv(
+    "CAD_REG_BLOCK_PROMPT",
+    "请用 1-2 句话描述此 CAD 图块涵盖的结构/构件、尺寸或关键标注，并指出可见的标签。",
+)
+DEFAULT_RAG_TOP_K = int(os.getenv("CAD_REG_RAG_TOP_K", "3"))
 
 
 @dataclass
@@ -66,6 +81,33 @@ class PageImage:
     height: int
 
 
+@dataclass
+class BlockHit:
+    block_id: str
+    doc_id: str
+    page_number: int
+    bbox: tuple[int, int, int, int]
+    image_path: Path
+    summary: str
+    score: float
+
+
+def _block_hit_from_record(record: dict) -> BlockHit | None:
+    image_path = Path(record.get("image_path", ""))
+    if not image_path.exists():
+        return None
+    bbox = _parse_bbox(record.get("bbox"))
+    return BlockHit(
+        block_id=str(record.get("block_id")),
+        doc_id=str(record.get("doc_id", "")),
+        page_number=int(record.get("page_number", 0)),
+        bbox=bbox,
+        image_path=image_path,
+        summary=str(record.get("summary", "")),
+        score=float(record.get("score", 0.0)),
+    )
+
+
 def _resolve_file_paths(files: Sequence[object]) -> List[Path]:
     paths: List[Path] = []
     for file in files:
@@ -88,6 +130,14 @@ def _default_api_key() -> str | None:
     )
 
 
+def _default_embedding_api_key() -> str | None:
+    return (
+        os.getenv("CAD_RAG_EMBED_API_KEY")
+        or os.getenv("MODELSCOPE_EMBED_API_KEY")
+        or _default_api_key()
+    )
+
+
 def _is_pdf(path: Path) -> bool:
     return path.suffix.lower() == ".pdf"
 
@@ -102,6 +152,14 @@ def _prepare_run_directories(run_id: str) -> tuple[Path, Path]:
     pages_root.mkdir(parents=True, exist_ok=True)
     tiles_root.mkdir(parents=True, exist_ok=True)
     return pages_root, tiles_root
+
+
+def _prepare_ingest_directories(run_id: str) -> tuple[Path, Path]:
+    pages_root = PAGE_OUTPUT_DIR / f"kb_{run_id}"
+    conn_root = CONNECTIVITY_OUTPUT_DIR / f"kb_{run_id}"
+    pages_root.mkdir(parents=True, exist_ok=True)
+    conn_root.mkdir(parents=True, exist_ok=True)
+    return pages_root, conn_root
 
 
 def _prepare_page_images(paths: Sequence[Path], pages_root: Path) -> List[PageImage]:
@@ -147,288 +205,396 @@ def _prepare_page_images(paths: Sequence[Path], pages_root: Path) -> List[PageIm
     return page_images
 
 
-def _prepare_grid_tiles(page_images: Sequence[PageImage], tiles_root: Path) -> List[TileContext]:
-    contexts: List[TileContext] = []
-    tile_counter = 0
-    for page in page_images:
-        tile_dir = tiles_root / f"{page.doc_slug}_page_{page.page_number:03d}"
-        tiles: List[TileInfo] = split_image_into_tiles(
-            page.path,
-            tile_dir,
-            rows=TILING_ROWS,
-            cols=TILING_COLS,
-            overlap=TILING_OVERLAP,
-            trim=False,
-            trim_tol=245,
-            enhance=False,
-            include_full_image=True,
+def _compute_grid_slices(width: int, height: int) -> tuple[int, int]:
+    rows = max(1, math.ceil(height / GRID_MAX_TILE_DIM))
+    cols = max(1, math.ceil(width / GRID_MAX_TILE_DIM))
+    return rows, cols
+
+
+def _parse_bbox(value: str | None) -> tuple[int, int, int, int]:
+    if not value:
+        return (0, 0, 0, 0)
+    try:
+        parts = [int(float(x.strip())) for x in value.split(",")]
+        while len(parts) < 4:
+            parts.append(0)
+        return tuple(parts[:4])  # type: ignore[return-value]
+    except Exception:
+        return (0, 0, 0, 0)
+
+
+def _describe_tile(tile: TileContext) -> str:
+    position_desc = (
+        "全图"
+        if tile.is_full_image
+        else (
+            f"行: {tile.row + 1} | 列: {tile.col + 1}"
+            if tile.row >= 0 and tile.col >= 0
+            else "自适应块"
         )
-        if not tiles:
-            raise ValueError(f"{page.source_file} 第 {page.page_number} 页未生成任何图块。")
-        for tile in tiles:
-            contexts.append(
-                TileContext(
-                    order=tile_counter,
-                    source_file=page.source_file,
-                    page_number=page.page_number,
-                    row=tile.row,
-                    col=tile.col,
-                    bbox=tile.bbox,
-                    path=tile.path,
-                    is_full_image=tile.is_full_image,
-                )
-            )
-            tile_counter += 1
-    return contexts
+    )
+    return (
+        f"[块{tile.order + 1:02d}] 文件: {tile.source_file} | 页: {tile.page_number} | "
+        f"{position_desc} | 区域: {tile.bbox}"
+    )
 
 
-def _prepare_connectivity_tiles(page_images: Sequence[PageImage], tiles_root: Path) -> List[TileContext]:
-    contexts: List[TileContext] = []
-    tile_counter = 0
-    for page in page_images:
-        tile_dir = tiles_root / f"{page.doc_slug}_page_{page.page_number:03d}_conn"
-        tile_dir.mkdir(parents=True, exist_ok=True)
-        segments = graph_split(
-            str(page.path),
-            tile_dir.as_posix(),
-            merge_threshold=CONNECTIVITY_MERGE_THRESHOLD,
-            grid_size=CONNECTIVITY_GRID_SIZE,
-            max_area_riot=CONNECTIVITY_MAX_AREA_RIOT,
-            min_area=CONNECTIVITY_MIN_AREA,
-        )
-        if not segments:
-            continue
-        for segment_path, bbox in segments:
-            x1, y1, x2, y2 = bbox
-            contexts.append(
-                TileContext(
-                    order=tile_counter,
-                    source_file=page.source_file,
-                    page_number=page.page_number,
-                    row=-1,
-                    col=-1,
-                    bbox=(x1, y1, x2, y2),
-                    path=Path(segment_path),
-                    is_full_image=False,
-                )
-            )
-            tile_counter += 1
-    return contexts
+def _build_block_prompt(base_prompt: str, tile: TileContext) -> str:
+    desc = _describe_tile(tile)
+    instructions = (
+        "请仅根据上述图块提供的内容回答用户问题相关的信息，"
+        "列出你在该块中发现的关键尺寸、标注或异常，若信息不足请说明。"
+    )
+    components = [base_prompt.strip(), "当前处理的图块：", desc, instructions]
+    return "\n\n".join(component for component in components if component)
 
 
-def _parse_split_choice(choice: str | None) -> bool:
-    if choice is None:
-        return True
-    normalized = choice.strip().lower()
-    if normalized in {"切块识别", "切块", "split"}:
-        return True
-    if normalized in {"原图识别", "原图", "nosplit"}:
-        return False
-    return True
+def _build_summary_prompt(base_prompt: str, blocks: Sequence[tuple[TileContext, str]]) -> str:
+    lines = [base_prompt.strip(), "以下是针对每个图块得到的识别结果："]
+    for tile, text in blocks:
+        lines.append(f"{_describe_tile(tile)}\n{text.strip()}")
+    lines.append(
+        "请综合所有图块的信息，给出最终答案，必要时指出块之间的矛盾或补充说明。"
+    )
+    return "\n\n".join(line for line in lines if line.strip())
 
 
-def _resolve_split_strategy(choice: str | None) -> str:
-    if not choice:
-        return "网格分块"
-    choice = choice.strip()
-    if choice in {"网格分块", "连通域分块"}:
-        return choice
-    return "网格分块"
 
 
-def _format_tile_context(tile_contexts: Sequence[TileContext]) -> str:
-    lines = []
-    for tile in tile_contexts:
-        position_desc = (
-            "全图"
-            if tile.is_full_image
-            else (
-                f"行: {tile.row + 1} | 列: {tile.col + 1}"
-                if tile.row >= 0 and tile.col >= 0
-                else "自适应块"
-            )
-        )
-        lines.append(
-            (
-                f"[块{tile.order + 1:02d}] 文件: {tile.source_file} | 页: {tile.page_number} | "
-                f"{position_desc} | 区域: {tile.bbox}"
-            )
-        )
-    return "图块上下文（按顺序送入模型）：\n" + "\n".join(lines)
 
 
-def analyze_cad_images(
+def rag_answer(
     files: Sequence[object],
-    prompt: str,
+    summary_prompt: str,
+    question: str,
     extra_prompt: str,
+    top_k: int,
+    embed_model: str,
+    embed_base_url: str,
+    embed_api_key: str,
     system_prompt: str,
     model: str,
     base_url: str,
     api_key: str,
     temperature: float,
     max_tokens: int,
-    split_choice: str,
-    split_strategy: str,
 ):
-    if not files:
-        yield "请至少上传一张图纸。"
-        return
     paths = _resolve_file_paths(files)
     if not paths:
-        yield "未能解析上传的图纸文件。"
+        yield "请先上传 CAD 图纸（PDF 或 PNG）。", [], []
         return
     missing = [p for p in paths if not p.exists()]
     if missing:
-        missing_str = ", ".join(str(p) for p in missing)
-        yield f"以下文件不存在或不可用: {missing_str}"
+        yield f"以下文件不存在或不可用: {', '.join(str(p) for p in missing)}", [], []
         return
 
-    final_prompt = (prompt or "").strip()
-    if extra_prompt and extra_prompt.strip():
-        final_prompt = f"{final_prompt}\n\n补充说明：{extra_prompt.strip()}"
-    if not final_prompt:
-        yield "请输入提示词。"
+    base_prompt = (question or "").strip()
+    if not base_prompt:
+        yield "请输入要查询的问题。", [], []
         return
 
+    describe_prompt = summary_prompt.strip() or DEFAULT_BLOCK_SUMMARY_PROMPT
     resolved_key = api_key.strip() or _default_api_key()
     if not resolved_key:
-        yield "请提供有效的 ModelScope API Key。"
+        yield "请提供有效的 ModelScope API Key。", [], []
         return
+
+    embed_model_value = embed_model.strip() if embed_model and embed_model.strip() else None
+    embed_base_value = embed_base_url.strip() if embed_base_url and embed_base_url.strip() else None
+    embed_key_value = embed_api_key.strip() if embed_api_key and embed_api_key.strip() else None
+    embed_kwargs = {
+        "model": embed_model_value,
+        "base_url": embed_base_value,
+        "api_key": embed_key_value,
+    }
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    try:
-        pages_root, tiles_root = _prepare_run_directories(run_id)
-    except Exception as exc:
-        yield f"无法准备输出目录: {exc}"
-        return
-
-    should_split = _parse_split_choice(split_choice)
-    strategy_choice = _resolve_split_strategy(split_strategy)
-
+    pages_root, conn_root = _prepare_ingest_directories(run_id)
     try:
         page_images = _prepare_page_images(paths, pages_root)
     except Exception as exc:
-        yield f"预处理失败: {exc}"
+        yield f"预处理失败: {exc}", [], []
+        return
+    if not page_images:
+        yield "未生成任何页面，无法构建知识库。", [], []
         return
 
-    if should_split:
+    aggregated = f"[{run_id}] 开始构建临时知识库...\n"
+    candidate_gallery: List[list[str]] = []
+    grid_gallery: List[list[str]] = []
+
+    def current_state():
+        return aggregated, list(candidate_gallery), list(grid_gallery)
+
+    yield current_state()
+
+    records: List[dict] = []
+    doc_ids: set[str] = set()
+
+    for page in page_images:
+        doc_id = f"{page.doc_slug}_{run_id}"
+        doc_ids.add(doc_id)
+        aggregated += f"处理 {page.source_file} 第 {page.page_number} 页...\n"
+        yield current_state()
+
+        conn_dir = conn_root / f"{page.doc_slug}_page_{page.page_number:03d}"
+        segments = graph_split(
+            str(page.path),
+            conn_dir.as_posix(),
+            merge_threshold=CONNECTIVITY_MERGE_THRESHOLD,
+            grid_size=CONNECTIVITY_GRID_SIZE,
+            max_area_riot=CONNECTIVITY_MAX_AREA_RIOT,
+            min_area=CONNECTIVITY_MIN_AREA,
+        )
+        if not segments:
+            aggregated += "  未检测到连通域块。\n"
+            yield current_state()
+            continue
+
+        for idx, (segment_path, bbox) in enumerate(segments):
+            block_id = f"{doc_id}_b{idx:03d}"
+            aggregated += f"  连通域块 {block_id} 提取语义...\n"
+            yield current_state()
+            prompt_text = (
+                f"{describe_prompt}\n\n文件: {page.source_file} 页码: {page.page_number}。"
+                "请聚焦该图块本身的结构、标注与尺寸。"
+            )
+            try:
+                description = call_modelscope_endpoint(
+                    base_url=base_url.strip() or DEFAULT_BASE_URL,
+                    api_key=resolved_key,
+                    model=model.strip() or DEFAULT_MODEL,
+                    system_prompt=system_prompt.strip() or DEFAULT_SYSTEM_PROMPT,
+                    prompt=prompt_text,
+                    image_paths=[Path(segment_path)],
+                    temperature=float(temperature),
+                    max_tokens=int(max_tokens),
+                )
+                if not description:
+                    description = "模型未返回描述。"
+            except Exception as exc:
+                description = f"描述失败: {exc}"
+            records.append(
+                {
+                    "block_id": block_id,
+                    "doc_id": doc_id,
+                    "page_number": page.page_number,
+                    "image_path": str(Path(segment_path).resolve()),
+                    "bbox": bbox,
+                    "summary": description,
+                }
+            )
+            preview = description.strip().replace("\n", " ")
+            aggregated += f"    完成。语义：{preview}\n"
+            yield current_state()
+
+    if not records:
+        yield "未检测到任何连通域块，请检查图纸。", list(candidate_gallery), list(grid_gallery)
+        return
+
+    try:
+        embeddings = embed_texts([record["summary"] for record in records], **embed_kwargs)
+    except Exception as exc:
+        yield f"生成嵌入失败: {exc}", list(candidate_gallery), list(grid_gallery)
+        return
+
+    try:
+        insert_blocks(records, embeddings)
+        aggregated += f"知识库构建完成：写入 {len(records)} 个块。\n"
+        yield current_state()
+    except Exception as exc:
+        yield f"写入 Milvus 失败: {exc}", list(candidate_gallery), list(grid_gallery)
+        return
+
+    try:
+        query_vector = embed_texts([base_prompt], **embed_kwargs)[0]
+    except Exception as exc:
+        yield f"生成查询向量失败: {exc}", list(candidate_gallery), list(grid_gallery)
+        return
+
+    doc_id_list = sorted(doc_ids)
+    rag_top_k = int(top_k) if top_k else DEFAULT_RAG_TOP_K
+    raw_hits = search_blocks(
+        query_vector,
+        top_k=rag_top_k,
+        doc_ids=doc_id_list,
+    )
+    block_hits = [hit for record in raw_hits if (hit := _block_hit_from_record(record))]
+    if not block_hits:
+        yield "未检索到匹配的连通域块，请尝试其他问题。", list(candidate_gallery), list(grid_gallery)
+        return
+
+    _, tiles_root = _prepare_run_directories(f"rag_{run_id}")
+
+    aggregated += "检索到以下候选连通域块：\n"
+    for idx, hit in enumerate(block_hits, start=1):
+        aggregated += (
+            f"[候选{idx}] doc={hit.doc_id} page={hit.page_number} score={hit.score:.3f}\n"
+            f"摘要：{hit.summary}\n\n"
+        )
+        if hit.image_path.exists():
+            candidate_gallery.append([str(hit.image_path), f"候选{idx} 分数 {hit.score:.3f}"])
+    yield current_state()
+
+    all_tile_results: List[tuple[TileContext, str]] = []
+    order_counter = 0
+
+    for rank, hit in enumerate(block_hits, start=1):
+        block_path = hit.image_path
+        if not block_path.exists():
+            aggregated += f"[候选{rank}] 图块文件缺失：{block_path}\n"
+            yield current_state()
+            continue
+
         try:
-            if strategy_choice == "连通域分块":
-                tile_contexts = _prepare_connectivity_tiles(page_images, tiles_root)
-            else:
-                tile_contexts = _prepare_grid_tiles(page_images, tiles_root)
+            with Image.open(block_path) as img:
+                width, height = img.size
         except Exception as exc:
-            yield f"分块失败: {exc}"
-            return
-        if not tile_contexts:
-            yield "预处理失败：未生成任何图块。"
-            return
-        artifact_desc = f"图块已保存至 {tiles_root.resolve()}。"
-    else:
-        tile_contexts = []
-        for order, page in enumerate(page_images):
-            tile_contexts.append(
+            aggregated += f"[候选{rank}] 无法打开图块: {exc}\n"
+            yield current_state()
+            continue
+
+        if width <= 1200 and height <= 1200:
+            tiles = [
                 TileContext(
-                    order=order,
-                    source_file=page.source_file,
-                    page_number=page.page_number,
+                    order=order_counter,
+                    source_file=hit.doc_id,
+                    page_number=hit.page_number,
                     row=-1,
                     col=-1,
-                    bbox=(0, 0, page.width, page.height),
-                    path=page.path,
+                    bbox=hit.bbox,
+                    path=block_path,
                     is_full_image=True,
                 )
+            ]
+            order_counter += 1
+            aggregated += f"[候选{rank}] 图块尺寸 {width}x{height}，直接整体识别。\n"
+            if block_path.exists():
+                grid_gallery.append([str(block_path), f"{hit.doc_id} 全图"])
+            yield current_state()
+        else:
+            rows, cols = _compute_grid_slices(width, height)
+            block_dir = tiles_root / hit.block_id
+            raw_tiles = split_image_into_tiles(
+                block_path,
+                block_dir,
+                rows=rows,
+                cols=cols,
+                overlap=TILING_OVERLAP,
+                trim=False,
+                trim_tol=245,
+                enhance=False,
+                include_full_image=False,
             )
-        if not tile_contexts:
-            yield "预处理失败：未生成任何原图供识别。"
-            return
-        artifact_desc = f"原图已保存至 {pages_root.resolve()}。"
+            if not raw_tiles:
+                aggregated += f"[候选{rank}] 未能生成网格切片。\n"
+                yield current_state()
+                continue
 
-    tile_paths = [ctx.path for ctx in tile_contexts]
-    tile_context_text = _format_tile_context(tile_contexts)
-    final_prompt = f"{final_prompt}\n\n{tile_context_text}"
+            tiles = []
+            for tile in raw_tiles:
+                tiles.append(
+                    TileContext(
+                        order=order_counter,
+                        source_file=hit.doc_id,
+                        page_number=hit.page_number,
+                        row=tile.row,
+                        col=tile.col,
+                        bbox=tile.bbox,
+                        path=tile.path,
+                        is_full_image=tile.is_full_image,
+                    )
+                )
+                if tile.path.exists():
+                    grid_gallery.append([str(tile.path), f"{hit.doc_id} 块{order_counter:03d}"])
+                order_counter += 1
 
-    mode_desc = "切块识别" if should_split else "原图识别"
-    strategy_desc = f"切块方式: {strategy_choice}" if should_split else "使用原图"
-    aggregated = (
-        f"{mode_desc}预处理完成：共准备 {len(tile_paths)} 个输入图像，保持顺序用于上下文。"
-        f"{artifact_desc}（批次: {run_id}; {strategy_desc}）\n\n"
-    )
-    yield aggregated
+            aggregated += f"[候选{rank}] 生成 {len(tiles)} 个网格切片。\n"
+            yield current_state()
 
-    received_tokens = False
+        for tile_ctx in tiles:
+            tile_label = f"[候选{rank}-块{tile_ctx.order:03d}]"
+            tile_header = f"{tile_label} 结果：\n"
+            tile_output = ""
+            yield aggregated + tile_header, list(candidate_gallery), list(grid_gallery)
+
+            combined_prompt = base_prompt
+            if extra_prompt and extra_prompt.strip():
+                combined_prompt = f"{combined_prompt}\n\n补充说明：{extra_prompt.strip()}"
+            block_prompt = _build_block_prompt(combined_prompt, tile_ctx)
+
+            try:
+                received = False
+                for delta in stream_modelscope_endpoint(
+                    base_url=base_url.strip() or DEFAULT_BASE_URL,
+                    api_key=resolved_key,
+                    model=model.strip() or DEFAULT_MODEL,
+                    system_prompt=system_prompt.strip() or DEFAULT_SYSTEM_PROMPT,
+                    prompt=block_prompt,
+                    image_paths=[tile_ctx.path],
+                    temperature=float(temperature),
+                    max_tokens=int(max_tokens),
+                ):
+                    received = True
+                    tile_output += delta
+                    yield aggregated + tile_header + tile_output, list(candidate_gallery), list(grid_gallery)
+                if not received:
+                    tile_output = "模型未返回有效文本。"
+            except Exception as exc:
+                tile_output = f"识别失败: {exc}"
+                yield aggregated + tile_header + tile_output, list(candidate_gallery), list(grid_gallery)
+
+            all_tile_results.append((tile_ctx, tile_output))
+            aggregated += tile_header + tile_output + "\n"
+            yield current_state()
+
+    aggregated += "候选块分析完成，正在整合最终答案...\n"
+    yield current_state()
+
+    combined_summary_prompt = base_prompt
+    if extra_prompt and extra_prompt.strip():
+        combined_summary_prompt = f"{combined_summary_prompt}\n\n补充说明：{extra_prompt.strip()}"
+    summary_prompt = _build_summary_prompt(combined_summary_prompt, all_tile_results)
+    summary_header = "综合回答：\n"
+    summary_output = ""
+    yield aggregated + summary_header, list(candidate_gallery), list(grid_gallery)
+
     try:
+        received = False
         for delta in stream_modelscope_endpoint(
             base_url=base_url.strip() or DEFAULT_BASE_URL,
             api_key=resolved_key,
             model=model.strip() or DEFAULT_MODEL,
             system_prompt=system_prompt.strip() or DEFAULT_SYSTEM_PROMPT,
-            prompt=final_prompt,
-            image_paths=tile_paths,
+            prompt=summary_prompt,
+            image_paths=[],
             temperature=float(temperature),
             max_tokens=int(max_tokens),
         ):
-            received_tokens = True
-            aggregated += delta
-            yield aggregated
-    except Exception as exc:  # pragma: no cover - surface runtime errors in UI
-        message = (aggregated + f"\n\n[错误] {exc}") if aggregated else f"推理失败: {exc}"
-        yield message
+            received = True
+            summary_output += delta
+            yield aggregated + summary_header + summary_output, list(candidate_gallery), list(grid_gallery)
+        if not received:
+            summary_output = "模型未返回有效文本。"
+    except Exception as exc:
+        summary_output = f"汇总失败: {exc}"
+        yield aggregated + summary_header + summary_output, list(candidate_gallery), list(grid_gallery)
         return
 
-    if not received_tokens:
-        aggregated = aggregated.rstrip() + "\n\n模型未返回有效文本，请重试。"
-        yield aggregated
+    aggregated += summary_header + summary_output
+    yield current_state()
 
 
 def build_interface() -> gr.Blocks:
     with gr.Blocks(title="CAD 图纸识别助手", css=SCROLL_CSS) as demo:
-        gr.Markdown("## CAD 工程图纸识别助手\n上传多张 CAD 图纸并输入要分析的问题。")
+        gr.Markdown("## CAD 图纸识别助手（上传 PDF → 连通域分块 → RAG 问答）")
 
-        with gr.Row():
-            file_input = gr.File(
-                label="CAD 图纸 (可多张)",
-                file_types=["image", "application/pdf"],
-                file_count="multiple",
-                type="file",
+        with gr.Accordion("模型与推理配置", open=False):
+            system_box = gr.Textbox(
+                label="系统提示词",
+                value=DEFAULT_SYSTEM_PROMPT,
+                lines=2,
             )
-            split_mode = gr.Radio(
-                label="处理方式",
-                choices=["切块识别", "原图识别"],
-                value="切块识别",
-            )
-            split_strategy = gr.Radio(
-                label="切块方式（仅在切块识别时生效）",
-                choices=["网格分块", "连通域分块"],
-                value="网格分块",
-            )
-
-        output_box = gr.Textbox(
-            label="分析结果",
-            lines=16,
-            interactive=False,
-            elem_classes=["scroll-output"],
-        )
-
-        prompt_box = gr.Textbox(
-            label="用户提示词",
-            placeholder="例如：综合分析两张楼层图的差异并给出关键尺寸。",
-            lines=3,
-        )
-
-        extra_prompt_box = gr.Textbox(
-            label="补充提示词（可选）",
-            placeholder="例如：请重点关注结构标高和楼层关系。",
-            lines=2,
-        )
-
-        system_box = gr.Textbox(
-            label="系统提示词",
-            value=DEFAULT_SYSTEM_PROMPT,
-            lines=2,
-        )
-
-        with gr.Accordion("高级设置", open=False):
             model_box = gr.Textbox(label="模型 ID", value=DEFAULT_MODEL)
             base_url_box = gr.Textbox(label="Base URL", value=DEFAULT_BASE_URL)
             api_key_box = gr.Textbox(
@@ -450,24 +616,93 @@ def build_interface() -> gr.Blocks:
                 maximum=4096,
                 step=128,
             )
+            gr.Markdown("### 嵌入模型配置")
+            embed_model_box = gr.Textbox(
+                label="Embedding 模型 ID",
+                value=DEFAULT_EMBED_MODEL,
+            )
+            embed_base_url_box = gr.Textbox(
+                label="Embedding Base URL",
+                value=DEFAULT_EMBED_BASE_URL,
+            )
+            embed_api_key_box = gr.Textbox(
+                label="Embedding API Key",
+                value=_default_embedding_api_key() or "",
+                type="password",
+            )
 
-        run_button = gr.Button("分析图纸", variant="primary")
-        run_button.click(
-            analyze_cad_images,
+        file_input = gr.File(
+            label="CAD 图纸 (PDF/PNG，可多文件)",
+            file_types=["image", "application/pdf"],
+            file_count="multiple",
+            type="file",
+        )
+        summary_prompt_box = gr.Textbox(
+            label="连通域语义提取提示词",
+            value=DEFAULT_BLOCK_SUMMARY_PROMPT,
+            lines=3,
+        )
+        question_box = gr.Textbox(
+            label="用户问题",
+            placeholder="例如：请找出图纸中剪力墙编号 WZ 的尺寸和标高。",
+            lines=3,
+        )
+        extra_prompt_box = gr.Textbox(
+            label="补充提示词（可选）",
+            placeholder="例如：若存在冲突请列出不同来源。",
+            lines=2,
+        )
+        topk_slider = gr.Slider(
+            label="RAG 候选块数量",
+            minimum=1,
+            maximum=10,
+            step=1,
+            value=DEFAULT_RAG_TOP_K,
+        )
+        answer_box = gr.Textbox(
+            label="答案（流式输出）",
+            lines=20,
+            interactive=False,
+            elem_classes=["scroll-output"],
+        )
+        gr.Markdown("### 图块预览")
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("**候选连通域块**")
+                candidate_gallery_box = gr.Gallery(
+                    label=None,
+                    columns=3,
+                    height="auto",
+                    interactive=False,
+                )
+            with gr.Column():
+                gr.Markdown("**网格分块（命中块）**")
+                grid_gallery_box = gr.Gallery(
+                    label=None,
+                    columns=3,
+                    height="auto",
+                    interactive=False,
+                )
+        answer_button = gr.Button("上传并开始问答", variant="primary")
+        answer_button.click(
+            rag_answer,
             inputs=[
                 file_input,
-                prompt_box,
+                summary_prompt_box,
+                question_box,
                 extra_prompt_box,
+                topk_slider,
+                embed_model_box,
+                embed_base_url_box,
+                embed_api_key_box,
                 system_box,
                 model_box,
                 base_url_box,
                 api_key_box,
                 temperature_slider,
                 max_tokens_slider,
-                split_mode,
-                split_strategy,
             ],
-            outputs=output_box,
+            outputs=[answer_box, candidate_gallery_box, grid_gallery_box],
         )
     return demo
 

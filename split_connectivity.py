@@ -56,6 +56,7 @@ def graph_split(
     grid_size=200,
     max_area_riot=0.25,
     min_area=150,
+    padding=80,
 ) -> List[Tuple[Path, Tuple[int, int, int, int]]]:
     """
     参数：
@@ -147,22 +148,23 @@ def graph_split(
     result: List[Tuple[Path, Tuple[int, int, int, int]]] = []
     os.makedirs(tmp_path, exist_ok=True)
     for idx, (x, y, w, h) in enumerate(final_rects):
+        pad = max(0, int(padding))
         # 边界安全检查（防止越界）
-        x = max(0, x)
-        y = max(0, y)
-        x2 = min(x + w, img.shape[1])
-        y2 = min(y + h, img.shape[0])
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(x + w + pad, img.shape[1])
+        y2 = min(y + h + pad, img.shape[0])
 
-        if x2 <= x or y2 <= y:
+        if x2 <= x1 or y2 <= y1:
             continue  # 无效区域，跳过
 
-        cropped = img[y:y2, x:x2]
+        cropped = img[y1:y2, x1:x2]
 
         # 保存为 crop_000.png, crop_001.png, ...
         filename = f"crop_{idx:03d}.png"
         save_path = Path(os.path.join(tmp_path, filename))
         cv2.imwrite(str(save_path), cropped)
-        result.append((save_path, (x, y, x2, y2)))
+        result.append((save_path, (x1, y1, x2, y2)))
 
     return result
 
