@@ -279,24 +279,29 @@ def rag_answer(
     temperature: float,
     max_tokens: int,
 ):
+    def _initial_output(
+        message: str,
+    ) -> tuple[str, list[list[str]], list[list[str]], list[list[str]]]:
+        return message, [], [], []
+
     paths = _resolve_file_paths(files)
     if not paths:
-        yield "请先上传 CAD 图纸（PDF 或 PNG）。", [], []
+        yield _initial_output("请先上传 CAD 图纸（PDF 或 PNG）。")
         return
     missing = [p for p in paths if not p.exists()]
     if missing:
-        yield f"以下文件不存在或不可用: {', '.join(str(p) for p in missing)}", [], []
+        yield _initial_output(f"以下文件不存在或不可用: {', '.join(str(p) for p in missing)}")
         return
 
     base_prompt = (question or "").strip()
     if not base_prompt:
-        yield "请输入要查询的问题。", [], []
+        yield _initial_output("请输入要查询的问题。")
         return
 
     describe_prompt = summary_prompt.strip() or DEFAULT_BLOCK_SUMMARY_PROMPT
     resolved_key = api_key.strip() or _default_api_key()
     if not resolved_key:
-        yield "请提供有效的 ModelScope API Key。", [], []
+        yield _initial_output("请提供有效的 ModelScope API Key。")
         return
 
     embed_model_value = embed_model.strip() if embed_model and embed_model.strip() else None
@@ -313,18 +318,24 @@ def rag_answer(
     try:
         page_images = _prepare_page_images(paths, pages_root)
     except Exception as exc:
-        yield f"预处理失败: {exc}", [], []
+        yield _initial_output(f"预处理失败: {exc}")
         return
     if not page_images:
-        yield "未生成任何页面，无法构建知识库。", [], []
+        yield _initial_output("未生成任何页面，无法构建知识库。")
         return
 
     aggregated = f"[{run_id}] 开始构建临时知识库...\n"
     candidate_gallery: List[list[str]] = []
     grid_gallery: List[list[str]] = []
+    connectivity_gallery: List[list[str]] = []
 
     def current_state():
-        return aggregated, list(candidate_gallery), list(grid_gallery)
+        return (
+            aggregated,
+            list(candidate_gallery),
+            list(grid_gallery),
+            list(connectivity_gallery),
+        )
 
     yield current_state()
 
@@ -354,6 +365,17 @@ def rag_answer(
         for idx, (segment_path, bbox) in enumerate(segments):
             block_id = f"{doc_id}_b{idx:03d}"
             aggregated += f"  连通域块 {block_id} 提取语义...\n"
+            segment_path_obj = Path(segment_path)
+            if segment_path_obj.exists():
+                connectivity_gallery.append(
+                    [
+                        str(segment_path_obj),
+                        (
+                            f"{page.source_file} 页{page.page_number} "
+                            f"块{idx + 1:03d} 区域{bbox}"
+                        ),
+                    ]
+                )
             yield current_state()
             prompt_text = (
                 f"{describe_prompt}\n\n文件: {page.source_file} 页码: {page.page_number}。"
@@ -366,7 +388,7 @@ def rag_answer(
                     model=model.strip() or DEFAULT_MODEL,
                     system_prompt=system_prompt.strip() or DEFAULT_SYSTEM_PROMPT,
                     prompt=prompt_text,
-                    image_paths=[Path(segment_path)],
+                    image_paths=[segment_path_obj],
                     temperature=float(temperature),
                     max_tokens=int(max_tokens),
                 )
@@ -379,7 +401,7 @@ def rag_answer(
                     "block_id": block_id,
                     "doc_id": doc_id,
                     "page_number": page.page_number,
-                    "image_path": str(Path(segment_path).resolve()),
+                    "image_path": str(segment_path_obj.resolve()),
                     "bbox": bbox,
                     "summary": description,
                 }
@@ -389,13 +411,23 @@ def rag_answer(
             yield current_state()
 
     if not records:
-        yield "未检测到任何连通域块，请检查图纸。", list(candidate_gallery), list(grid_gallery)
+        yield (
+            "未检测到任何连通域块，请检查图纸。",
+            list(candidate_gallery),
+            list(grid_gallery),
+            list(connectivity_gallery),
+        )
         return
 
     try:
         embeddings = embed_texts([record["summary"] for record in records], **embed_kwargs)
     except Exception as exc:
-        yield f"生成嵌入失败: {exc}", list(candidate_gallery), list(grid_gallery)
+        yield (
+            f"生成嵌入失败: {exc}",
+            list(candidate_gallery),
+            list(grid_gallery),
+            list(connectivity_gallery),
+        )
         return
 
     try:
@@ -403,13 +435,23 @@ def rag_answer(
         aggregated += f"知识库构建完成：写入 {len(records)} 个块。\n"
         yield current_state()
     except Exception as exc:
-        yield f"写入 Milvus 失败: {exc}", list(candidate_gallery), list(grid_gallery)
+        yield (
+            f"写入 Milvus 失败: {exc}",
+            list(candidate_gallery),
+            list(grid_gallery),
+            list(connectivity_gallery),
+        )
         return
 
     try:
         query_vector = embed_texts([base_prompt], **embed_kwargs)[0]
     except Exception as exc:
-        yield f"生成查询向量失败: {exc}", list(candidate_gallery), list(grid_gallery)
+        yield (
+            f"生成查询向量失败: {exc}",
+            list(candidate_gallery),
+            list(grid_gallery),
+            list(connectivity_gallery),
+        )
         return
 
     doc_id_list = sorted(doc_ids)
@@ -421,19 +463,36 @@ def rag_answer(
     )
     block_hits = [hit for record in raw_hits if (hit := _block_hit_from_record(record))]
     if not block_hits:
-        yield "未检索到匹配的连通域块，请尝试其他问题。", list(candidate_gallery), list(grid_gallery)
+        yield (
+            "未检索到匹配的连通域块，请尝试其他问题。",
+            list(candidate_gallery),
+            list(grid_gallery),
+            list(connectivity_gallery),
+        )
         return
 
     _, tiles_root = _prepare_run_directories(f"rag_{run_id}")
 
+    block_sizes: dict[str, tuple[int, int]] = {}
     aggregated += "检索到以下候选连通域块：\n"
     for idx, hit in enumerate(block_hits, start=1):
         aggregated += (
             f"[候选{idx}] doc={hit.doc_id} page={hit.page_number} score={hit.score:.3f}\n"
             f"摘要：{hit.summary}\n\n"
         )
+        size_suffix = ""
         if hit.image_path.exists():
-            candidate_gallery.append([str(hit.image_path), f"候选{idx} 分数 {hit.score:.3f}"])
+            try:
+                with Image.open(hit.image_path) as preview_img:
+                    width, height = preview_img.size
+                block_sizes[hit.block_id] = (width, height)
+                size_suffix = f" | {width}x{height}px"
+            except Exception as exc:
+                aggregated += f"[候选{idx}] 无法读取图块尺寸: {exc}\n"
+        if hit.image_path.exists():
+            candidate_gallery.append(
+                [str(hit.image_path), f"候选{idx} 分数 {hit.score:.3f}{size_suffix}"]
+            )
     yield current_state()
 
     all_tile_results: List[tuple[TileContext, str]] = []
@@ -446,11 +505,22 @@ def rag_answer(
             yield current_state()
             continue
 
-        try:
-            with Image.open(block_path) as img:
-                width, height = img.size
-        except Exception as exc:
-            aggregated += f"[候选{rank}] 无法打开图块: {exc}\n"
+        width: int | None = None
+        height: int | None = None
+        cached_size = block_sizes.get(hit.block_id)
+        if cached_size:
+            width, height = cached_size
+        else:
+            try:
+                with Image.open(block_path) as img:
+                    width, height = img.size
+                block_sizes[hit.block_id] = (width, height)
+            except Exception as exc:
+                aggregated += f"[候选{rank}] 无法打开图块: {exc}\n"
+                yield current_state()
+                continue
+        if width is None or height is None:
+            aggregated += f"[候选{rank}] 图块尺寸缺失，跳过。\n"
             yield current_state()
             continue
 
@@ -470,7 +540,8 @@ def rag_answer(
             order_counter += 1
             aggregated += f"[候选{rank}] 图块尺寸 {width}x{height}，直接整体识别。\n"
             if block_path.exists():
-                grid_gallery.append([str(block_path), f"{hit.doc_id} 全图"])
+                label = f"{hit.doc_id} 全图 {width}x{height}px"
+                grid_gallery.append([str(block_path), label])
             yield current_state()
         else:
             rows, cols = _compute_grid_slices(width, height)
@@ -506,7 +577,14 @@ def rag_answer(
                     )
                 )
                 if tile.path.exists():
-                    grid_gallery.append([str(tile.path), f"{hit.doc_id} 块{order_counter:03d}"])
+                    tile_w = max(1, tile.bbox[2] - tile.bbox[0])
+                    tile_h = max(1, tile.bbox[3] - tile.bbox[1])
+                    grid_gallery.append(
+                        [
+                            str(tile.path),
+                            f"{hit.doc_id} 块{order_counter:03d} {tile_w}x{tile_h}px",
+                        ]
+                    )
                 order_counter += 1
 
             aggregated += f"[候选{rank}] 生成 {len(tiles)} 个网格切片。\n"
@@ -516,7 +594,12 @@ def rag_answer(
             tile_label = f"[候选{rank}-块{tile_ctx.order:03d}]"
             tile_header = f"{tile_label} 结果：\n"
             tile_output = ""
-            yield aggregated + tile_header, list(candidate_gallery), list(grid_gallery)
+            yield (
+                aggregated + tile_header,
+                list(candidate_gallery),
+                list(grid_gallery),
+                list(connectivity_gallery),
+            )
 
             combined_prompt = base_prompt
             if extra_prompt and extra_prompt.strip():
@@ -537,12 +620,22 @@ def rag_answer(
                 ):
                     received = True
                     tile_output += delta
-                    yield aggregated + tile_header + tile_output, list(candidate_gallery), list(grid_gallery)
+                    yield (
+                        aggregated + tile_header + tile_output,
+                        list(candidate_gallery),
+                        list(grid_gallery),
+                        list(connectivity_gallery),
+                    )
                 if not received:
                     tile_output = "模型未返回有效文本。"
             except Exception as exc:
                 tile_output = f"识别失败: {exc}"
-                yield aggregated + tile_header + tile_output, list(candidate_gallery), list(grid_gallery)
+                yield (
+                    aggregated + tile_header + tile_output,
+                    list(candidate_gallery),
+                    list(grid_gallery),
+                    list(connectivity_gallery),
+                )
 
             all_tile_results.append((tile_ctx, tile_output))
             aggregated += tile_header + tile_output + "\n"
@@ -557,7 +650,12 @@ def rag_answer(
     summary_prompt = _build_summary_prompt(combined_summary_prompt, all_tile_results)
     summary_header = "综合回答：\n"
     summary_output = ""
-    yield aggregated + summary_header, list(candidate_gallery), list(grid_gallery)
+    yield (
+        aggregated + summary_header,
+        list(candidate_gallery),
+        list(grid_gallery),
+        list(connectivity_gallery),
+    )
 
     try:
         received = False
@@ -573,12 +671,22 @@ def rag_answer(
         ):
             received = True
             summary_output += delta
-            yield aggregated + summary_header + summary_output, list(candidate_gallery), list(grid_gallery)
+            yield (
+                aggregated + summary_header + summary_output,
+                list(candidate_gallery),
+                list(grid_gallery),
+                list(connectivity_gallery),
+            )
         if not received:
             summary_output = "模型未返回有效文本。"
     except Exception as exc:
         summary_output = f"汇总失败: {exc}"
-        yield aggregated + summary_header + summary_output, list(candidate_gallery), list(grid_gallery)
+        yield (
+            aggregated + summary_header + summary_output,
+            list(candidate_gallery),
+            list(grid_gallery),
+            list(connectivity_gallery),
+        )
         return
 
     aggregated += summary_header + summary_output
@@ -665,6 +773,14 @@ def build_interface() -> gr.Blocks:
             interactive=False,
             elem_classes=["scroll-output"],
         )
+        gr.Markdown("### 连通域分块预览（全部图块）")
+        connectivity_gallery_box = gr.Gallery(
+            label=None,
+            columns=4,
+            height="auto",
+            interactive=False,
+        )
+
         gr.Markdown("### 图块预览")
         with gr.Row():
             with gr.Column():
@@ -702,7 +818,12 @@ def build_interface() -> gr.Blocks:
                 temperature_slider,
                 max_tokens_slider,
             ],
-            outputs=[answer_box, candidate_gallery_box, grid_gallery_box],
+            outputs=[
+                answer_box,
+                candidate_gallery_box,
+                grid_gallery_box,
+                connectivity_gallery_box,
+            ],
         )
     return demo
 
